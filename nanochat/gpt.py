@@ -9,7 +9,9 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- Causal windowed running-mean attention: q ⊙ causal_mean(k), elementwise (hs never
+  collapsed to a scalar affinity), no softmax, v unused. O(T) not O(T^2). See
+  CausalSelfAttention.forward for the derivation/comments.
 """
 
 from functools import partial
@@ -21,9 +23,6 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
-
-# Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
-from nanochat.flash_attention import flash_attn
 
 @dataclass
 class GPTConfig:
@@ -76,6 +75,10 @@ class CausalSelfAttention(nn.Module):
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        # c_v/ve_gate are kept defined (init_weights() references block.attn.c_v.weight
+        # and block.attn.ve_gate.weight directly) but are never called in forward() --
+        # this attention variant doesn't use v. setup_optimizer() below excludes their
+        # params from every optimizer group since their .grad is always None.
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
@@ -84,45 +87,50 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # Project to queries and keys only -- v is intentionally unused by this
+        # attention variant (see comment in __init__)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
-            v = v + gate.unsqueeze(-1) * ve
-
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # Rotary + QK-norm, unchanged from the softmax-attention version
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
+        if kv_cache is not None:
+            raise NotImplementedError(
+                "CumsumMeanAttention: kv_cache decoding needs a running-sum state "
+                "per layer instead of a token buffer, not implemented (see nanochat/engine.py). "
+                "Training and generate()-without-cache are unaffected."
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
 
-        # Re-assemble the heads and project back to residual stream
+        # --- causal windowed running-mean attention, replaces softmax(QK^T)V ---
+        # out[b,i,h] = q[b,i,h] * mean_{j in [i-left, i]} k[b,j,h]
+        # Derivation: q[b,i,h] doesn't depend on j, so it factors out of the causal
+        # sum entirely -- windowed mean of k is computed once via a difference of
+        # two cumsums, then multiplied by q a single time. No (B,T,T,*) tensor
+        # is ever formed; cost is O(T*hs), independent of window size.
+        left = window_size[0]  # tokens attended before current pos (S or L window)
+        k_cumsum = torch.cumsum(k.float(), dim=1)                     # (B,T,n_kv_head,D)
+        zero = k_cumsum.new_zeros(B, 1, self.n_kv_head, self.head_dim)
+        k_cumsum_pad = torch.cat([zero, k_cumsum], dim=1)             # (B,T+1,n_kv_head,D)
+
+        idx = torch.arange(T, device=x.device)
+        start = (idx - left).clamp(min=0)
+        sum_end = k_cumsum_pad[:, idx + 1]                            # (B,T,n_kv_head,D)
+        sum_start = k_cumsum_pad[:, start]
+        counts = (idx - start + 1).view(1, T, 1, 1).to(k_cumsum.dtype)
+        k_meancum = ((sum_end - sum_start) / counts).to(k.dtype)      # (B,T,n_kv_head,D)
+
+        # GQA: broadcast kv heads up to n_head query heads
+        group_size = self.n_head // self.n_kv_head
+        if group_size > 1:
+            k_meancum = k_meancum.repeat_interleave(group_size, dim=2)  # (B,T,n_head,D)
+
+        y = q * k_meancum   # (B,T,n_head,D) -- no (B,T,T,*) tensor ever formed
+
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -321,20 +329,18 @@ class GPT(nn.Module):
         Return the estimated FLOPs per token for the model (forward + backward).
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
         Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+
+        NOTE: attention here is the causal windowed running-mean variant
+        (q * causal_mean(k)), not softmax(QK^T)V. Its per-token cost is O(head_dim) --
+        a small constant, independent of sequence length or window size, since q
+        factors out of the causal sum entirely (see CausalSelfAttention.forward).
+        Unlike the original PaLM-style 12*h*q*effective_seq_len term, this does NOT
+        scale with window/seq length, and is negligible (~1e-3x) next to the matmul
+        term at typical model dims -- included only for completeness.
         """
-        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+        n_embd = self.config.n_embd
+        # cumsum add + windowed pad-diff subtract + divide (kv_dim) + elementwise mul (n_embd), fwd+bwd
+        attn_flops = self.config.n_layer * 8 * n_embd
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
         return num_flops_per_token
 
@@ -344,47 +350,68 @@ class GPT(nn.Module):
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+
+        NOTE: c_v and ve_gate are excluded here even though they're nn.Linear --
+        the causal windowed running-mean attention variant never calls them in
+        forward() (v is unused by design), so they contribute 0 real FLOPs.
+        Counting them would overstate every FLOPs estimate that depends on this.
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        dead = set()
+        for block in self.transformer.h:
+            dead.add(block.attn.c_v)
+            if block.attn.ve_gate is not None:
+                dead.add(block.attn.ve_gate)
+        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear) and m not in dead)
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
         """
         Forward FLOPs to decode one token at a given context length during inference:
-        2 FLOPs per matmul param, plus attention over min(context, window) per layer.
+        2 FLOPs per matmul param, plus attention overhead.
+
+        NOTE: attention overhead is O(head_dim) per token for this variant, not
+        O(context_len) -- context_len is accepted for interface compatibility but
+        no longer affects the estimate. Also NOTE: incremental (kv_cache) decoding
+        isn't implemented yet for this attention variant (see CausalSelfAttention.forward),
+        so this function is provisional / for future use.
         """
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
+        n_embd = self.config.n_embd
+        attn_flops = self.config.n_layer * 4 * n_embd  # forward-only
         decode_flops = 2 * self.num_matmul_params() + attn_flops
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
-        """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        attn_flops = 0
-        for window, _ in self.window_sizes:
-            w = min(window, num_tokens)
-            attended_tokens = w * (w + 1) // 2 + (num_tokens - w) * w # ramp up to w, then flat
-            attn_flops += 4 * h * q * attended_tokens
+        """Forward FLOPs to prefill a prompt.
+
+        NOTE: attention cost is linear in num_tokens (O(head_dim) per token), not the
+        ramp-then-flat windowed-quadratic shape softmax attention has. Same kv_cache
+        caveat as estimate_decode_flops.
+        """
+        n_embd = self.config.n_embd
+        attn_flops = self.config.n_layer * 4 * n_embd * num_tokens
         prefill_flops = 2 * self.num_matmul_params() * num_tokens + attn_flops
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
+        """Bytes to *store* one token of cache during inference, per row (all layers).
+
+        NOTE: only k needs caching -- v is unused by this attention variant. This
+        still describes a token-buffer cache; incremental decoding isn't implemented
+        yet (see CausalSelfAttention.forward), so treat this as provisional.
+        """
         head_dim = self.config.n_embd // self.config.n_head
-        kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
-        return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
+        kv_dtype_bytes = COMPUTE_DTYPE.itemsize
+        return self.config.n_layer * 1 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
-        """Bytes of KV cache *read* by one decode step at a given context length, per row.
-        Sliding window layers only attend to (and read) the last `window` tokens."""
+        """Bytes read by one decode step at a given context length, per row.
+        Same caveats as kv_bytes_per_token -- only k, provisional pending a real
+        incremental-decoding implementation for this attention variant."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
         for window, _ in self.window_sizes:
-            total += 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
+            total += 1 * self.config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
         return total
 
     def num_scaling_params(self):
@@ -419,15 +446,30 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
 
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
+        # c_v, ve_gate, and value_embeds are unused by the causal windowed running-mean
+        # attention variant (v is never consumed in forward), so their .grad is always
+        # None after backward(). Exclude them from every optimizer group -- Muon's
+        # per-shape torch.stack([p.grad for p in params]) crashes on the first None it
+        # finds (c_q/c_k/c_v/c_proj can share shape (n_embd,n_embd) when n_head==n_kv_head,
+        # landing in the same Muon shape-group -- this is what threw
+        # "TypeError: expected Tensor ... got NoneType").
+        dead_suffixes = ('attn.c_v.weight', 'attn.ve_gate.weight')
+        matrix_params = [p for n, p in self.transformer.h.named_parameters() if not n.endswith(dead_suffixes)]
+        dead_matrix_params = [p for n, p in self.transformer.h.named_parameters() if n.endswith(dead_suffixes)]
+        value_embeds_params = []  # unused by this attention variant -> excluded entirely
+        dead_embed_params = list(self.value_embeds.parameters())
+
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == (
+            len(matrix_params) + len(dead_matrix_params)
+            + len(embedding_params) + len(lm_head_params)
+            + len(value_embeds_params) + len(dead_embed_params)
+            + len(resid_params) + len(x0_params) + len(smear_params)
+        )
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -438,7 +480,7 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            # value_embeds group intentionally omitted -- unused, would be a dead group
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
