@@ -99,28 +99,35 @@ class CausalSelfAttention(nn.Module):
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
-        if kv_cache is not None:
-            raise NotImplementedError(
-                "CumsumMeanAttention: kv_cache decoding needs a running-sum state "
-                "per layer instead of a token buffer, not implemented (see nanochat/engine.py). "
-                "Training and generate()-without-cache are unaffected."
-            )
+        left = window_size[0]  # tokens attended before current pos (S or L window)
+
+        if kv_cache is None:
+            # Training / naive generate: no persistent history, T0 is always 0.
+            k_hist, T0 = k, 0
+        else:
+            # Incremental decode: stash new K into this layer's cache buffer (only K --
+            # V is unused, see __init__), then recompute the windowed mean over cached
+            # history + the new tokens. This re-scans up to T0+T keys per call (O(T0+T),
+            # not O(1)) -- fine for the short eval-time samples base_train.py generates;
+            # a real running (sum, count) per window would be needed for long-context
+            # incremental decoding.
+            k_buf, _v_buf = kv_cache.get_layer_cache(self.layer_idx)  # (B, max_seq_len, n_kv_head, D)
+            T0 = kv_cache.get_pos()  # position before this call (synced across the batch)
+            k_buf[:, T0:T0 + T] = k.to(k_buf.dtype)
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+            k_hist = k_buf[:, :T0 + T].to(k.dtype)
 
         # --- causal windowed running-mean attention, replaces softmax(QK^T)V ---
         # out[b,i,h] = q[b,i,h] * mean_{j in [i-left, i]} k[b,j,h]
-        # Derivation: q[b,i,h] doesn't depend on j, so it factors out of the causal
-        # sum entirely -- windowed mean of k is computed once via a difference of
-        # two cumsums, then multiplied by q a single time. No (B,T,T,*) tensor
-        # is ever formed; cost is O(T*hs), independent of window size.
-        left = window_size[0]  # tokens attended before current pos (S or L window)
-        k_cumsum = torch.cumsum(k.float(), dim=1)                     # (B,T,n_kv_head,D)
+        k_cumsum = torch.cumsum(k_hist.float(), dim=1)
         zero = k_cumsum.new_zeros(B, 1, self.n_kv_head, self.head_dim)
-        k_cumsum_pad = torch.cat([zero, k_cumsum], dim=1)             # (B,T+1,n_kv_head,D)
+        k_cumsum_pad = torch.cat([zero, k_cumsum], dim=1)             # (B, T0+T+1, n_kv_head, D)
 
-        idx = torch.arange(T, device=x.device)
+        idx = torch.arange(T0, T0 + T, device=x.device)               # absolute positions of this call's queries
         start = (idx - left).clamp(min=0)
-        sum_end = k_cumsum_pad[:, idx + 1]                            # (B,T,n_kv_head,D)
-        sum_start = k_cumsum_pad[:, start]
+        sum_end = k_cumsum_pad[:, idx + 1 - T0]                        # index relative to k_hist's own start
+        sum_start = k_cumsum_pad[:, start - T0]
         counts = (idx - start + 1).view(1, T, 1, 1).to(k_cumsum.dtype)
         k_meancum = ((sum_end - sum_start) / counts).to(k.dtype)      # (B,T,n_kv_head,D)
 
@@ -129,7 +136,7 @@ class CausalSelfAttention(nn.Module):
         if group_size > 1:
             k_meancum = k_meancum.repeat_interleave(group_size, dim=2)  # (B,T,n_head,D)
 
-        y = q * k_meancum   # (B,T,n_head,D) -- no (B,T,T,*) tensor ever formed
+        y = q * k_meancum
 
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
